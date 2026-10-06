@@ -1,0 +1,7 @@
+{
+  "name": "Telegram Audio Scraper & S3 Uploader",
+  "description": "Scrapes audio tracks and media from Telegram channels, extracts metadata, and uploads to ArvanCloud / AWS S3 buckets with real-time progress and history tracking.",
+  "capabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}

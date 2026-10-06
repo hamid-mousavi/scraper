@@ -1,0 +1,41 @@
+name: Audio Sync Pipeline
+
+on:
+  schedule:
+    # اجرا هر ۴ ساعت یکبار به صورت خودکار
+    - cron: '0 */4 * * *'
+  # امکان اجرای دستی از تب Actions در گیتهاب
+  workflow_dispatch:
+
+jobs:
+  scrape-and-upload:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: بررسی سورس کد ریپازیتوری
+        uses: actions/checkout@v4
+
+      - name: راهاندازی پایتون
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: نصب کتابخانهها
+        run: |
+          pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: اجرای اسکریپت دانلود و آپلود
+        env:
+          ARVAN_ENDPOINT: ${{ secrets.ARVAN_ENDPOINT }}
+          ARVAN_ACCESS_KEY: ${{ secrets.ARVAN_ACCESS_KEY }}
+          ARVAN_SECRET_KEY: ${{ secrets.ARVAN_SECRET_KEY }}
+          ARVAN_BUCKET_NAME: ${{ secrets.ARVAN_BUCKET_NAME }}
+        run: python scraper.py
+
+      - name: ذخیره تاریخچه فایلها برای جلوگیری از تکرار
+        run: |
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+          git add uploaded_history.txt
+          git diff --quiet && git diff --staged --quiet || (git commit -m "chore: بروزرسانی تاریخچه دانلود" && git push)
