@@ -1,41 +1,127 @@
-name: Audio Sync Pipeline
+import os
+import requests
+from bs4 import BeautifulSoup
+import boto3
+from botocore.exceptions import ClientError
 
-on:
-  schedule:
-    # اجرا هر ۴ ساعت یکبار به صورت خودکار
-    - cron: '0 */4 * * *'
-  # امکان اجرای دستی از تب Actions در گیتهاب
-  workflow_dispatch:
+CHANNEL = "MajalesAlKhaqani"
+URL = f"https://t.me/s/{CHANNEL}"
+HISTORY_FILE = "uploaded_history.txt"
 
-jobs:
-  scrape-and-upload:
-    runs-on: ubuntu-latest
+s3 = boto3.client(
+    "s3",
+    endpoint_url=os.environ["ARVAN_ENDPOINT"].strip(),
+    aws_access_key_id=os.environ["ARVAN_ACCESS_KEY"].strip(),
+    aws_secret_access_key=os.environ["ARVAN_SECRET_KEY"].strip(),
+)
+BUCKET = os.environ["ARVAN_BUCKET_NAME"].strip()
 
-    steps:
-      - name: بررسی سورس کد ریپازیتوری
-        uses: actions/checkout@v4
+HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/124.0.0.0 Safari/537.36"
+}
 
-      - name: راهاندازی پایتون
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.11'
+def load_history():
+    if os.path.exists(HISTORY_FILE):
+        with open(HISTORY_FILE, "r", encoding="utf-8") as f:
+            return set(line.strip() for line in f if line.strip())
+    return set()
 
-      - name: نصب کتابخانهها
-        run: |
-          pip install --upgrade pip
-          pip install -r requirements.txt
+def save_history(history):
+    with open(HISTORY_FILE, "w", encoding="utf-8") as f:
+        for item in sorted(history):
+            f.write(f"{item}\n")
 
-      - name: اجرای اسکریپت دانلود و آپلود
-        env:
-          ARVAN_ENDPOINT: ${{ secrets.ARVAN_ENDPOINT }}
-          ARVAN_ACCESS_KEY: ${{ secrets.ARVAN_ACCESS_KEY }}
-          ARVAN_SECRET_KEY: ${{ secrets.ARVAN_SECRET_KEY }}
-          ARVAN_BUCKET_NAME: ${{ secrets.ARVAN_BUCKET_NAME }}
-        run: python scraper.py
+def run():
+    history = load_history()
+    print(f"--- شروع پردازش کانال {CHANNEL} ---")
+    
+    resp = requests.get(URL, headers=HEADERS, timeout=20)
+    if resp.status_code != 200:
+        print(f"خطا در باز کردن کانال تلگرام: کد {resp.status_code}")
+        return
 
-      - name: ذخیره تاریخچه فایلها برای جلوگیری از تکرار
-        run: |
-          git config --global user.name "github-actions[bot]"
-          git config --global user.email "github-actions[bot]@users.noreply.github.com"
-          git add uploaded_history.txt
-          git diff --quiet && git diff --staged --quiet || (git commit -m "chore: بروزرسانی تاریخچه دانلود" && git push)
+    soup = BeautifulSoup(resp.text, "html.parser")
+    messages = soup.find_all("div", class_="tgme_widget_message")
+    print(f"تعداد کل پیام‌های یافت‌شده در صفحه: {len(messages)}")
+
+    uploaded_count = 0
+
+    for msg in messages:
+        post_id = msg.get("data-post", "").split("/")[-1]
+        if not post_id or post_id in history:
+            continue
+
+        audio_url = None
+
+        # حالت اول: تگ استاندارد audio
+        audio_tag = msg.find("audio")
+        if audio_tag and audio_tag.get("src"):
+            audio_url = audio_tag["src"]
+
+        # حالت دوم: لینک استریم در تگ‌های صوتی وب تلگرام
+        if not audio_url:
+            voice_player = msg.find("a", class_="tgme_widget_message_voice_player")
+            if voice_player and voice_player.get("href"):
+                audio_url = voice_player["href"]
+
+        # حالت سوم: فایل ارسالی به صورت document
+        if not audio_url:
+            doc_link = msg.find("a", class_="tgme_widget_message_document_wrap")
+            if doc_link and doc_link.get("href"):
+                href = doc_link["href"]
+                # بررسی اینکه آیا به فایل صوتی یا پخش مربوط است
+                if "stream" in href or href.endswith((".mp3", ".m4a", ".ogg")):
+                    audio_url = href
+
+        # اگر فایلی یافت نشد پیام بعدی بررسی شود
+        if not audio_url:
+            continue
+
+        # استخراج متادیتا
+        title_el = msg.find("div", class_="tgme_widget_message_document_title")
+        subtitle_el = msg.find("div", class_="tgme_widget_message_document_subtitle")
+        
+        title = title_el.get_text(strip=True) if title_el else f"audio_{post_id}"
+        performer = subtitle_el.get_text(strip=True) if subtitle_el else "Unknown"
+
+        safe_name = f"{post_id}_{title[:40]}.mp3".replace("/", "_").replace("\\", "_").replace(" ", "_")
+        temp_path = f"/tmp/{safe_name}"
+
+        print(f"در حال دانلود: [{performer} - {title}]")
+        print(f"لینک منبع: {audio_url}")
+
+        try:
+            with requests.get(audio_url, headers=HEADERS, stream=True, timeout=60) as r:
+                r.raise_for_status()
+                with open(temp_path, "wb") as f:
+                    for chunk in r.iter_content(chunk_size=1024 * 1024):
+                        f.write(chunk)
+
+            file_size_mb = os.path.getsize(temp_path) / (1024 * 1024)
+            print(f"دانلود موفق ({file_size_mb:.2f} MB). در حال ارسال به ابر آروان...")
+
+            s3_key = f"tracks/{safe_name}"
+            s3.upload_file(
+                temp_path,
+                BUCKET,
+                s3_key,
+                ExtraArgs={"ACL": "public-read", "ContentType": "audio/mpeg"}
+            )
+            print(f"آپلود موفق به آروان: {s3_key}")
+            
+            history.add(post_id)
+            uploaded_count += 1
+
+        except ClientError as e:
+            print(f"خطای S3 در ارتباط با آروان: {e}")
+        except Exception as e:
+            print(f"خطا در پردازش فایل {post_id}: {e}")
+        finally:
+            if os.path.exists(temp_path):
+                os.remove(temp_path)
+
+    print(f"--- پایان: تعداد {uploaded_count} فایل جدید به صندوقچه اضافه شد ---")
+    save_history(history)
+
+if __name__ == "__main__":
+    run()
